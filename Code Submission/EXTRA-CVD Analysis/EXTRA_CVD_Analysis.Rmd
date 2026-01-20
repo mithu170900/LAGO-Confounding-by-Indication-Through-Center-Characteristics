@@ -1,0 +1,847 @@
+---
+title: "Month 4, Month 8, and Month 12 Outcomes"
+date: "March 6, 2025"
+output:
+  pdf_document:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{hyperref}
+  - \hypersetup{colorlinks=true, linkcolor=blue, urlcolor=blue}
+  - \usepackage{amssymb}  % For mathematical symbols
+  - \usepackage{textgreek} % For Greek symbols
+  - \usepackage{longtable}
+
+
+---
+```{r, include = FALSE}
+# -------------------------------------------------------------
+# Load libraries and read/prepare data
+# -------------------------------------------------------------
+library(dplyr)
+library(haven)
+library(gee)
+library(lubridate)
+library(corrplot)
+library(MuMIn)
+library(car)
+library(clubSandwich)
+library(fixest)
+library(sandwich)
+library(LAGO)
+library(lmtest)
+library(plm)
+library(pheatmap)
+library(gridExtra)
+library(ggplot2)
+library(sandwich)
+library(tidyr)
+library(lmtest)
+library(lme4)
+library(lmerTest)
+library(geepack)
+```
+
+```{r, include = FALSE}
+source("Cat_Month4HelperFunction.R")
+source("Cat_Month8HelperFunction.R")
+source("Cat_Month12HelperFunction.R")
+```
+
+
+```{r, include = FALSE}
+# -------------------------------------------------------------
+# Read in datasets
+# -------------------------------------------------------------
+extra_cvd <- read_sas("~/Dropbox/LAGO EXTRA-CVD/Data/extracvd_clean_internal_21mar24.sas7bdat")
+enrollment_data <- read.csv("/Users/minhthubui/Dropbox/LAGO EXTRA-CVD/Data/EXTRACVD_date_shifted_enrollment_2025_01_30.csv")
+enrollment_data$enroll_date_shifted <- as.Date(as.character(enrollment_data$enroll_date_shifted),
+                                               format = "%m/%d/%Y")
+
+# Merge datasets by patient id
+data <- merge(extra_cvd, enrollment_data, by = "pid", all = TRUE)
+# A = UH, B = Metro, and C = Duke.
+# Subset to needed columns
+data <- data[, c("pid","redcap_data_access_group","enroll_date_shifted", "malesexx", "hx_HD",
+                 "pc_date","pc_counsel_bp", "pc_counsel_risk",
+                 "pc_counsel_meds","pc_counsel_sideeffects","pc_counsel_diet","pc_counsel_phys","pc_counsel_smoke",
+                 "homebp_dateentry", "homebp_sysbp", 
+                 "sbp_final","blvisit", "m4visit", "m8visit","m12visit", "studyarm", "wd_date")]
+
+# 1: Male, 0: Female
+data$enroll_date_shifted <- as.Date(data$enroll_date_shifted)
+data$center <- as.factor(data$redcap_data_access_group)
+data$studyarm <- as.factor(data$studyarm)
+
+data$center <- ifelse(data$center == "uh", "A",
+                      ifelse(data$center == "metro", "B",
+                             ifelse(data$center == "duke", "C", data$center)))
+
+# Create a numeric version of enrollment date (day 0 = minimum enroll date)
+min_date <- min(data$enroll_date_shifted, na.rm = TRUE)
+date_mapping <- data.frame(
+  enroll_date_shifted = unique(data$enroll_date_shifted),
+  enroll_date_numeric = as.numeric(unique(data$enroll_date_shifted) - min_date)
+)
+data <- merge(data, date_mapping, by = "enroll_date_shifted", all.x = TRUE)
+
+# For each patient, if all wd_date values are NA then set to 0; otherwise, take the non-NA
+data <- data %>%
+  group_by(pid) %>%
+  mutate(wd_date = if(all(is.na(wd_date))) 0 else na.omit(wd_date)) %>%
+  ungroup()
+
+# DEBUG: View(data[, c("pid", "wd_date")]) - All columns are imputed correctly
+
+# Define counseling time mapping (in minutes)
+counseling_time_map <- c("0" = 0, "1" = 2.5, "2" = 7.5, "3" = 15, "4" = 20)
+data <- data %>%
+  mutate(timeDuration_pc_counsel_bp       = counseling_time_map[as.character(pc_counsel_bp)],
+         timeDuration_pc_counsel_risk     = counseling_time_map[as.character(pc_counsel_risk)],
+         timeDuration_pc_counsel_meds     = counseling_time_map[as.character(pc_counsel_meds)],
+         timeDuration_pc_counsel_sideeffects = counseling_time_map[as.character(pc_counsel_sideeffects)],
+         timeDuration_pc_counsel_diet     = counseling_time_map[as.character(pc_counsel_diet)],
+         timeDuration_pc_counsel_phys     = counseling_time_map[as.character(pc_counsel_phys)],
+         timeDuration_pc_counsel_smoke    = counseling_time_map[as.character(pc_counsel_smoke)])
+
+# Create enrollment period and interval (for later merging)
+min_enroll_date <- min(data$enroll_date_shifted)
+data <- data %>%
+  mutate(enroll_period = floor(as.numeric(difftime(enroll_date_shifted, min_enroll_date, units = "days"))/30) + 1,
+         enrollment_interval = case_when(
+           enroll_period <= 7  ~ 1,
+           enroll_period <= 14 ~ 2,
+           enroll_period <= 21 ~ 3,
+           TRUE              ~ 4
+         ))
+
+# Create record-taken dates for each data collection type
+data <- data %>%
+  mutate(records_taken_date_counseling = enroll_date_numeric + pc_date,
+         records_taken_date_homebp     = enroll_date_numeric + homebp_dateentry)
+```
+
+```{r}
+# ---------------------------------------------------
+# Precompute Window Start/End Dates for Each Patient
+# wd_date == 0 indicates no withdrawal
+# ---------------------------------------------------
+
+windows <- data %>%
+  group_by(pid) %>%
+  summarise(
+    enroll_date_shifted = unique(enroll_date_shifted),
+    enroll_date_numeric = unique(enroll_date_numeric),
+    wd_date = unique(wd_date)
+  ) %>%
+  mutate(
+    # Month 1-4 window 
+    window_start_m1_m4 = enroll_date_numeric,
+    window_end_m1_m4 = ifelse(wd_date == 0, 
+                              enroll_date_numeric + 119,
+                              pmin(enroll_date_numeric + 119, enroll_date_numeric + wd_date)
+                             ),
+    
+    # M5-M8 indicator: follow-up extends into M5-M8 if no withdrawal or withdrawal occurs after day 120
+    # If a participant withdraws before day 120 (i.e., wd_date < 120), then in_window_m5_m8 will be set to 0
+    # This means both window_start_m5_m8 and window_end_m5_m8 will be set to NA
+    # These participants don't contribute any data to the Month 5-8 window
+    
+    in_window_m5_m8 = ifelse((wd_date == 0) | (wd_date >= 120), 1, 0),
+    # Only calculate month 5-8 window if indicator is 1; otherwise, set to NA
+    window_start_m5_m8 = ifelse(in_window_m5_m8 == 1,
+                                enroll_date_numeric + 120,
+                                NA),
+    window_end_m5_m8 = ifelse(in_window_m5_m8 == 1,
+                              ifelse(wd_date == 0,
+                                     enroll_date_numeric + 239,
+                                     pmin(enroll_date_numeric + 239, enroll_date_numeric + wd_date)),
+                              NA),
+                              
+    # Indicator: follow-up extends into M8-M12 if no withdrawal or withdrawal occurs after day 240
+    # Same logic as M5-M8.
+    in_window_m9_m12 = ifelse((wd_date == 0) | (wd_date >= 240), 1, 0),
+    # Only calculate month 8-12 window if indicator is 1; otherwise, set to NA
+    window_start_m9_m12 = ifelse(in_window_m9_m12 == 1,
+                                 enroll_date_numeric + 240,
+                                 NA),
+    window_end_m9_m12 = ifelse(in_window_m9_m12 == 1,
+                               ifelse(wd_date == 0,
+                                      enroll_date_numeric + 359,
+                                      pmin(enroll_date_numeric + 359, enroll_date_numeric + wd_date)),
+                               NA)
+  ) %>%
+  ungroup()
+
+# Merge back into the main dataset
+windows_subset <- windows %>% 
+  dplyr::select(pid, enroll_date_numeric, wd_date, window_start_m1_m4, window_end_m1_m4, 
+         window_start_m5_m8, window_end_m5_m8, in_window_m5_m8,
+         window_start_m9_m12, window_end_m9_m12, in_window_m9_m12)
+
+data <- left_join(data, windows_subset)
+centers <- unique(data$redcap_data_access_group)
+
+# DEBUG:filtered_data <- windows_subset[windows_subset$wd_date > 0, ]
+# 4 people that withdraw after their month-8 but they were not in month-12
+# because they did not have m12visit. 
+# ids_to_check <- c("CT1040", "CT3088", "CT1117", "CT3027")
+# ids_to_check %in% base_dataset_m12_Month12$pid
+# The two in the middle are in month-4 and month-8.
+```
+
+# Month-4 Data Gathering and Intervention Components:
+```{r, warning = FALSE, include = FALSE}
+# -------------------------------------------------------------
+# APPLY FUNCTIONS & MERGE RESULTS
+# -------------------------------------------------------------
+# --- For Month 1-4 outcomes ---
+
+# Step 1: Create base dataset with pids from m4visit
+base_dataset_m4_Month4 <- data %>%
+  filter(m4visit == 1 & !is.na(sbp_final)) %>%
+  select(center, 
+         pid, 
+         malesexx,
+         enroll_date_numeric, 
+         wd_date,
+         studyarm) %>%
+  distinct()
+
+# Step 2: Calculate values for intervention group
+intervention_homebp_m4_Month4 <- data %>%
+  filter(pid %in% base_dataset_m4_Month4$pid & studyarm == 1) %>%
+  calculate_homebp_m1_m4()
+
+intervention_counseling_m4_Month4 <- data %>%
+  filter(pid %in% base_dataset_m4_Month4$pid & studyarm == 1) %>%
+  calculate_counseling_metrics_m1_m4()
+
+
+# Steps 3: Merge intervention results and set control values to 0
+final_results_m1_m4 <- base_dataset_m4_Month4 %>%
+  left_join(intervention_homebp_m4_Month4) %>%
+  left_join(intervention_counseling_m4_Month4) %>%
+  mutate(
+    # Counseling minutes month 4 outcomes
+    total_minutes_m1_m4 = ifelse(is.na(total_minutes_m1_m4), 0, total_minutes_m1_m4),
+    total_active_days_m1_m4 = ifelse(is.na(total_active_days_m1_m4), 0, total_active_days_m1_m4),
+    avg_counseling_m1_m4 = ifelse(is.na(avg_counseling_m1_m4), 0, avg_counseling_m1_m4),
+    
+    # Home BP measurements month 4 outcomes
+    total_homebp_measurements_m1_m4 = ifelse(is.na(total_homebp_measurements_m1_m4), 0, total_homebp_measurements_m1_m4),
+    total_length_of_stay_m1_m4 = ifelse(is.na(total_length_of_stay_m1_m4), 0, total_length_of_stay_m1_m4),
+    avg_homebp_measurements_m1_m4 = ifelse(is.na(avg_homebp_measurements_m1_m4), 0, avg_homebp_measurements_m1_m4),
+  )
+```
+
+```{r, warning = FALSE}
+# Steps 4: Calculate the delta_sbp_m1_m4. 
+  # Get baseline blood pressure data
+bl_data <- data %>% 
+  filter(blvisit == 1 & !is.na(sbp_final)) %>%
+  select(center, studyarm, pid, sbp_bl = sbp_final)
+
+  # Get month 4 blood pressure data
+m4_data <- data %>% 
+  filter(m4visit == 1 & !is.na(sbp_final)) %>%
+  select(center, studyarm, pid, sbp_m4 = sbp_final)
+
+  # Calculate delta sbp (change from baseline to month 4)
+bp_data_m1_m4 <- inner_join(bl_data, m4_data) %>%
+  mutate(delta_sbp_m1_m4 = sbp_m4 - sbp_bl)
+
+# Step 5: Merge BP change data with the final dataset for use
+final_results_m1_m4 <- final_results_m1_m4 %>%
+  left_join(bp_data_m1_m4)
+```
+
+# Month-8 Data Gathering and Intervention Components:
+```{r, warning = FALSE, include = FALSE}
+# -------------------------------------------------------------
+# APPLY FUNCTIONS & MERGE RESULTS
+# -------------------------------------------------------------
+# --- For Month 1-8 outcomes ---
+
+# Step 1: Create base dataset with pids from m4visit
+base_dataset_m8_Month8 <- data %>%
+  filter(m8visit == 1 & !is.na(sbp_final)) %>%
+  select(center, 
+         pid, 
+         malesexx,
+         enroll_date_numeric,
+         wd_date,
+         studyarm) %>%
+  distinct()
+
+# Step 2: Calculate values for intervention group for both periods, m1-4 and m5-8
+intervention_homebp_m4_Month8 <- data %>%
+  filter(pid %in% base_dataset_m8_Month8$pid & studyarm == 1) %>%
+  calculate_homebp_m1_m4()
+
+intervention_counseling_m4_Month8 <- data %>%
+  filter(pid %in% base_dataset_m8_Month8$pid & studyarm == 1) %>%
+  calculate_counseling_metrics_m1_m4()
+
+intervention_homebp_m8_Month8 <- data %>%
+  filter(pid %in% base_dataset_m8_Month8$pid & studyarm == 1) %>%
+  calculate_homebp_m5_m8()
+
+intervention_counseling_m8_Month8 <- data %>%
+  filter(pid %in% base_dataset_m8_Month8$pid & studyarm == 1) %>%
+  calculate_counseling_metrics_m5_m8()
+
+# Steps 3: Merge intervention results and set control values to 0
+final_results_m1_m8 <- base_dataset_m8_Month8 %>%
+  left_join(intervention_homebp_m4_Month8) %>%
+  left_join(intervention_homebp_m8_Month8) %>%
+  left_join(intervention_counseling_m4_Month8) %>%
+  left_join(intervention_counseling_m8_Month8) %>%
+  mutate(
+    # Home BP Month 1-4 period
+    total_homebp_measurements_m1_m4 = ifelse(is.na(total_homebp_measurements_m1_m4), 0, total_homebp_measurements_m1_m4),
+    total_length_of_stay_m1_m4 = ifelse(is.na(total_length_of_stay_m1_m4), 0, total_length_of_stay_m1_m4),
+    avg_homebp_measurements_m1_m4 = ifelse(is.na(avg_homebp_measurements_m1_m4), 0, avg_homebp_measurements_m1_m4),
+    
+    # Counseling minutes Month 1-4 period
+    total_minutes_m1_m4 = ifelse(is.na(total_minutes_m1_m4), 0, total_minutes_m1_m4),
+    total_active_days_m1_m4 = ifelse(is.na(total_active_days_m1_m4), 0, total_active_days_m1_m4),
+    avg_counseling_m1_m4 = ifelse(is.na(avg_counseling_m1_m4), 0, avg_counseling_m1_m4),
+    
+    # Home BP Month 5-8 period
+    total_homebp_measurements_m5_m8 = ifelse(is.na(total_homebp_measurements_m5_m8), 0, total_homebp_measurements_m5_m8),
+    total_length_of_stay_m5_m8 = ifelse(is.na(total_length_of_stay_m5_m8), 0, total_length_of_stay_m5_m8),
+    avg_homebp_measurements_m5_m8 = ifelse(is.na(avg_homebp_measurements_m5_m8), 0, avg_homebp_measurements_m5_m8),
+    
+    # Counseling minutes Month 5-8 period
+    total_minutes_m5_m8 = ifelse(is.na(total_minutes_m5_m8), 0, total_minutes_m5_m8),
+    total_active_days_m5_m8 = ifelse(is.na(total_active_days_m5_m8), 0, total_active_days_m5_m8),
+    avg_counseling_m5_m8 = ifelse(is.na(avg_counseling_m5_m8), 0, avg_counseling_m5_m8)
+    
+  )
+
+# Home BP Month 8 outcomes
+final_results_m1_m8$avg_homebp_measurements_m1_m8 <- (final_results_m1_m8$avg_homebp_measurements_m1_m4 
+                                                       + final_results_m1_m8$avg_homebp_measurements_m5_m8) / 2
+
+# Counseling minutes Month 8 period
+final_results_m1_m8$avg_counseling_m1_m8 <- (final_results_m1_m8$avg_counseling_m1_m4 
+                                                       + final_results_m1_m8$avg_counseling_m5_m8) / 2
+```
+
+```{r, warning=FALSE}
+# Steps 4: Calculate the delta_sbp_m1_m8. 
+
+  # Get month 8 blood pressure data
+m8_data <- data %>% 
+  filter(m8visit == 1 & !is.na(sbp_final)) %>%
+  select(center, studyarm, pid, sbp_m8 = sbp_final)
+
+  # Calculate delta sbp (change from baseline to month 8)
+bp_data_m1_m8 <- inner_join(bl_data, m8_data) %>%
+  mutate(delta_sbp_m1_m8 = sbp_m8 - sbp_bl)
+
+# Step 5: Merge BP change data with the final dataset for use
+final_results_m1_m8 <- final_results_m1_m8 %>%
+  left_join(bp_data_m1_m8)
+```
+
+
+# Month-12 Data Gathering and Intervention Components:
+
+```{r, warning = FALSE}
+# --- For Month 1-12 outcomes ---
+# Step 1: Create base dataset with pids from m12visit
+base_dataset_m12_Month12 <- data %>%
+  filter(m12visit == 1 & !is.na(sbp_final)) %>%
+  select(center, 
+         pid, 
+         malesexx,
+         enroll_date_numeric, 
+         wd_date,
+         studyarm) %>%
+  distinct()
+
+# Step 2: Calculate values for intervention group for all three periods
+intervention_homebp_m4_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+  calculate_homebp_m1_m4()
+
+intervention_homebp_m8_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+  calculate_homebp_m5_m8()
+
+intervention_homebp_m12_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+  calculate_homebp_m9_m12()
+
+intervention_counseling_m4_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+  calculate_counseling_metrics_m1_m4()
+
+intervention_counseling_m8_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+    calculate_counseling_metrics_m5_m8()
+
+intervention_counseling_m12_Month12 <- data %>%
+  filter(pid %in% base_dataset_m12_Month12$pid & studyarm == 1) %>%
+    calculate_counseling_metrics_m9_m12()
+
+# Step 3: Merge intervention results and set control values to 0
+final_results_m1_m12 <- base_dataset_m12_Month12 %>%
+  left_join(intervention_homebp_m4_Month12) %>%
+  left_join(intervention_homebp_m8_Month12) %>%
+  left_join(intervention_homebp_m12_Month12) %>%
+  left_join(intervention_counseling_m4_Month12) %>%
+  left_join(intervention_counseling_m8_Month12) %>%
+  left_join(intervention_counseling_m12_Month12) %>%
+  mutate(
+    # Home BP m1_m4 values
+    total_homebp_measurements_m1_m4 = ifelse(is.na(total_homebp_measurements_m1_m4), 0, total_homebp_measurements_m1_m4),
+    total_length_of_stay_m1_m4 = ifelse(is.na(total_length_of_stay_m1_m4), 0, total_length_of_stay_m1_m4),
+    avg_homebp_measurements_m1_m4 = ifelse(is.na(avg_homebp_measurements_m1_m4), 0, avg_homebp_measurements_m1_m4),
+    
+    # Counseling minutes Month 1-4 period
+    total_minutes_m1_m4 = ifelse(is.na(total_minutes_m1_m4), 0, total_minutes_m1_m4),
+    total_active_days_m1_m4 = ifelse(is.na(total_active_days_m1_m4), 0, total_active_days_m1_m4),
+    avg_counseling_m1_m4 = ifelse(is.na(avg_counseling_m1_m4), 0, avg_counseling_m1_m4),
+    
+    # Home BP m5_m8 values
+    total_homebp_measurements_m5_m8 = ifelse(is.na(total_homebp_measurements_m5_m8), 0, total_homebp_measurements_m5_m8),
+    total_length_of_stay_m5_m8 = ifelse(is.na(total_length_of_stay_m5_m8), 0, total_length_of_stay_m5_m8),
+    avg_homebp_measurements_m5_m8 = ifelse(is.na(avg_homebp_measurements_m5_m8), 0, avg_homebp_measurements_m5_m8),
+    
+    # Counseling minutes Month 5-8 period
+    total_minutes_m5_m8 = ifelse(is.na(total_minutes_m5_m8), 0, total_minutes_m5_m8),
+    total_active_days_m5_m8 = ifelse(is.na(total_active_days_m5_m8), 0, total_active_days_m5_m8),
+    avg_counseling_m5_m8 = ifelse(is.na(avg_counseling_m5_m8), 0, avg_counseling_m5_m8),
+    
+     # Home BP m9_m12 values
+    total_homebp_measurements_m9_m12 = ifelse(is.na(total_homebp_measurements_m9_m12), 0, total_homebp_measurements_m9_m12),
+    total_length_of_stay_m9_m12 = ifelse(is.na(total_length_of_stay_m9_m12), 0, total_length_of_stay_m9_m12),
+    avg_homebp_measurements_m9_m12 = ifelse(is.na(avg_homebp_measurements_m9_m12), 0, avg_homebp_measurements_m9_m12),
+    
+    # Counseling minutes Month 9-12 period
+    total_minutes_m9_m12 = ifelse(is.na(total_minutes_m9_m12), 0, total_minutes_m9_m12),
+    total_active_days_m9_m12 = ifelse(is.na(total_active_days_m9_m12), 0, total_active_days_m9_m12),
+    avg_counseling_m9_m12 = ifelse(is.na(avg_counseling_m9_m12), 0, avg_counseling_m9_m12),
+  )
+
+# Home BP m1-m12 period
+final_results_m1_m12$avg_homebp_measurements_m1_m12 <- 
+  (final_results_m1_m12$avg_homebp_measurements_m1_m4 + 
+   final_results_m1_m12$avg_homebp_measurements_m5_m8 + 
+   final_results_m1_m12$avg_homebp_measurements_m9_m12) / 3
+
+# Counseling m1-m12 period
+final_results_m1_m12$avg_counseling_m1_m12 <- (final_results_m1_m12$avg_counseling_m1_m4 
+                                                   + final_results_m1_m12$avg_counseling_m5_m8
+                                                   + final_results_m1_m12$avg_counseling_m9_m12) / 3
+```
+
+```{r, warning = FALSE}
+# Steps 4: Calculate the delta_sbp_m1_m12. 
+  # Get month 12 blood pressure data
+m12_data <- data %>% 
+  filter(m12visit == 1 & !is.na(sbp_final)) %>%
+  select(center, studyarm, pid, sbp_m12 = sbp_final)
+
+  # Calculate delta sbp (change from baseline to month 12)
+bp_data_m1_m12 <- inner_join(bl_data, m12_data) %>%
+  mutate(delta_sbp_m1_m12 = sbp_m12 - sbp_bl)
+
+# Step 5: Merge BP change data with the final dataset for use
+final_results_m1_m12 <- final_results_m1_m12 %>%
+  left_join(bp_data_m1_m12)
+```
+
+
+```{r}
+# Convert to categorical/ dummy and set reference levels
+final_results_m1_m4$studyarm <- relevel(final_results_m1_m4$studyarm, ref = "0")
+final_results_m1_m4$center <- factor(final_results_m1_m4$center)
+
+final_results_m1_m8$studyarm <- relevel(final_results_m1_m8$studyarm, ref = "0")
+final_results_m1_m8$center <- factor(final_results_m1_m8$center)
+
+final_results_m1_m12$studyarm <- factor(final_results_m1_m12$studyarm, levels = c("0", "1"))
+final_results_m1_m12$studyarm <- relevel(final_results_m1_m12$studyarm, ref = "0")
+final_results_m1_m12$center <- factor(final_results_m1_m12$center)
+```
+
+# Average comparison table:
+```{r}
+library(dplyr)
+
+# Helper function to calculate mean and 95% CI
+summary_ci <- function(x) {
+  m <- mean(x, na.rm = TRUE)
+  se <- sd(x, na.rm = TRUE) / sqrt(sum(!is.na(x)))
+  ci_lower <- m - 1.96 * se
+  ci_upper <- m + 1.96 * se
+  return(c(mean = m, lower = ci_lower, upper = ci_upper))
+}
+
+# Step 1: Baseline table (mean only)
+baseline_table <- bl_data %>%
+  group_by(center, studyarm) %>%
+  summarise(SBP_Baseline = mean(sbp_bl, na.rm = TRUE), .groups = "drop")
+
+# Step 2: Delta SBP tables (mean + CI)
+delta_m4 <- final_results_m1_m4 %>%
+  group_by(center, studyarm) %>%
+  summarise(mean_m4 = mean(delta_sbp_m1_m4, na.rm = TRUE),
+            lower_m4 = mean(delta_sbp_m1_m4, na.rm = TRUE) - 1.96 * sd(delta_sbp_m1_m4, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m4))),
+            upper_m4 = mean(delta_sbp_m1_m4, na.rm = TRUE) + 1.96 * sd(delta_sbp_m1_m4, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m4))),
+            .groups = "drop")
+
+delta_m8 <- final_results_m1_m8 %>%
+  group_by(center, studyarm) %>%
+  summarise(mean_m8 = mean(delta_sbp_m1_m8, na.rm = TRUE),
+            lower_m8 = mean(delta_sbp_m1_m8, na.rm = TRUE) - 1.96 * sd(delta_sbp_m1_m8, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m8))),
+            upper_m8 = mean(delta_sbp_m1_m8, na.rm = TRUE) + 1.96 * sd(delta_sbp_m1_m8, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m8))),
+            .groups = "drop")
+
+delta_m12 <- final_results_m1_m12 %>%
+  group_by(center, studyarm) %>%
+  summarise(mean_m12 = mean(delta_sbp_m1_m12, na.rm = TRUE),
+            lower_m12 = mean(delta_sbp_m1_m12, na.rm = TRUE) - 1.96 * sd(delta_sbp_m1_m12, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m12))),
+            upper_m12 = mean(delta_sbp_m1_m12, na.rm = TRUE) + 1.96 * sd(delta_sbp_m1_m12, na.rm = TRUE)/sqrt(sum(!is.na(delta_sbp_m1_m12))),
+            .groups = "drop")
+
+# Step 3: Merge everything together
+final_table <- baseline_table %>%
+  left_join(delta_m4, by = c("center", "studyarm")) %>%
+  left_join(delta_m8, by = c("center", "studyarm")) %>%
+  left_join(delta_m12, by = c("center", "studyarm"))
+
+# Step 4: Recode study arm
+final_table <- final_table %>%
+  mutate(Study_Arm = ifelse(studyarm == 0, "Control", "Intervention"))
+
+# Step 5: Format only the ΔSBP columns into "mean (lower, upper)"
+final_table <- final_table %>%
+  mutate(
+    Delta_SBP_Month4 = sprintf("%.2f (%.2f, %.2f)", mean_m4, lower_m4, upper_m4),
+    Delta_SBP_Month8 = sprintf("%.2f (%.2f, %.2f)", mean_m8, lower_m8, upper_m8),
+    Delta_SBP_Month12 = sprintf("%.2f (%.2f, %.2f)", mean_m12, lower_m12, upper_m12)
+  ) %>%
+  select(Facility = center, Study_Arm, SBP_Baseline,
+         Delta_SBP_Month4, Delta_SBP_Month8, Delta_SBP_Month12)
+
+# View the final table
+print(final_table)
+
+
+```
+# LAGO Optimization table with Averages
+```{r}
+mean(final_results_m1_m4$avg_counseling_m1_m4)
+mean(final_results_m1_m8$avg_counseling_m1_m8)
+mean(final_results_m1_m12$avg_counseling_m1_m12)
+
+mean(final_results_m1_m4$avg_homebp_measurements_m1_m4)
+mean(final_results_m1_m8$avg_homebp_measurements_m1_m8)
+mean(final_results_m1_m12$avg_homebp_measurements_m1_m12)
+```
+
+```{r}
+write.csv(final_results_m1_m4, "final_results_m1_m4.csv", row.names = FALSE)
+write.csv(final_results_m1_m8, "final_results_m1_m8.csv", row.names = FALSE)
+write.csv(final_results_m1_m12, "final_results_m1_m12.csv", row.names = FALSE)
+```
+
+# Models:
+```{r}
+models_m4 <- lm(delta_sbp_m1_m4 ~ 0 +  avg_counseling_m1_m4 + avg_homebp_measurements_m1_m4 + center,
+                data = final_results_m1_m4)
+models_m8 <- lm(delta_sbp_m1_m8 ~ 0 + avg_counseling_m1_m8 + avg_homebp_measurements_m1_m8 + center, 
+                data = final_results_m1_m8)
+models_m12 <- lm(delta_sbp_m1_m12 ~ 0 + avg_counseling_m1_m12 + avg_homebp_measurements_m1_m12 + center, 
+                 data = final_results_m1_m12)
+
+coeftest(models_m4, vcov = sandwich)
+coefci(models_m4, vcov. = sandwich, level = 0.95)
+
+coeftest(models_m8, vcov = sandwich)
+coefci(models_m8, vcov. = sandwich, level = 0.95)
+
+coeftest(models_m12, vcov = sandwich)
+coefci(models_m12, vcov. = sandwich, level = 0.95)
+```
+
+```{r}
+models_m4_control <- lm(delta_sbp_m1_m4 ~ 0 +  avg_counseling_m1_m4 + avg_homebp_measurements_m1_m4 + center,
+                data = final_results_m1_m4[final_results_m1_m4$studyarm == 0, ])
+models_m8_control <- lm(delta_sbp_m1_m8 ~ 0 + avg_counseling_m1_m8 + avg_homebp_measurements_m1_m8 + center, 
+                data = final_results_m1_m8[final_results_m1_m8$studyarm == 0,])
+models_m12_control <- lm(delta_sbp_m1_m12 ~ 0 + avg_counseling_m1_m12 + avg_homebp_measurements_m1_m12 + center, 
+                 data = final_results_m1_m12[final_results_m1_m12$studyarm == 0,])
+coeftest(models_m4_control, vcov = sandwich)
+coefci(models_m4_control, vcov. = sandwich, level = 0.95)
+
+coeftest(models_m8_control, vcov = sandwich)
+coefci(models_m8_control, vcov. = sandwich, level = 0.95)
+
+coeftest(models_m12_control, vcov = sandwich)
+coefci(models_m12_control, vcov. = sandwich, level = 0.95)
+```
+
+# LAGO optimization:
+```{r}
+range(final_results_m1_m4$avg_counseling_m1_m4)
+range(final_results_m1_m4$avg_homebp_measurements_m1_m4)
+
+range(final_results_m1_m8$avg_counseling_m1_m8)
+range(final_results_m1_m8$avg_homebp_measurements_m1_m8)
+
+range(final_results_m1_m12$avg_counseling_m1_m12)
+range(final_results_m1_m12$avg_homebp_measurements_m1_m12)
+
+x_min_m4 <- c(0, 0)
+x_min_m8 <- c(0, 0)
+x_min_m12 <- c(0, 0)
+
+x_max_m4 <- c(10, 4)
+x_max_m8 <- c(8, 3)
+x_max_m12 <- c(6.5, 3)
+```
+
+### Linear Cost Function:
+```{r}
+opt_m4 <- lago_optimization(
+  data = final_results_m1_m4,
+  outcome_name = "delta_sbp_m1_m4",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m4", "avg_homebp_measurements_m1_m4"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(10, 4),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = list(c(0, 1), c(0, 0.5)),
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = FALSE,
+  confidence_set_grid_step_size = c(1, 1)
+)
+```
+
+```{r}
+opt_m8 <- lago_optimization(
+  data = final_results_m1_m8,
+  outcome_name = "delta_sbp_m1_m8",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m8", "avg_homebp_measurements_m1_m8"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(8, 3),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = list(c(0, 1), c(0, 0.5)),
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = FALSE
+)
+```
+
+```{r}
+opt_m12 <- lago_optimization(
+  data = final_results_m1_m12,
+  outcome_name = "delta_sbp_m1_m12",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m12", "avg_homebp_measurements_m1_m12"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(6.5, 3),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = list(c(0, 1), c(0, 0.5)),
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = F
+)
+```
+```{r}
+cost_list <- list(
+  c(0, 1.25, 0, -0.04, 0.0055),
+  c(0, 0.63, 0, -0.09, 0.026)
+)
+```
+
+### Cubic Cost Function:
+```{r}
+opt_m4_cubic <- lago_optimization(
+  data = final_results_m1_m4,
+  outcome_name = "delta_sbp_m1_m4",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m4", "avg_homebp_measurements_m1_m4"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(10, 4),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = cost_list,
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = FALSE
+)
+```
+```{r}
+opt_m8_cubic <- lago_optimization(
+  data = final_results_m1_m8,
+  outcome_name = "delta_sbp_m1_m8",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m8", "avg_homebp_measurements_m1_m8"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(8, 3),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = cost_list,
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = F
+)
+```
+```{r}
+opt_m12_cubic <- lago_optimization(
+  data = final_results_m1_m12,
+  input_data_structure = "individual_level",
+  outcome_name = "delta_sbp_m1_m12",
+  outcome_type = "continuous",
+  glm_family = "gaussian",
+  link = "identity",
+  intervention_components = c("avg_counseling_m1_m12", "avg_homebp_measurements_m1_m12"),
+  intervention_lower_bounds = c(0, 0),
+  intervention_upper_bounds = c(6.5, 3),
+  include_center_effects = TRUE,
+  cost_list_of_vectors = cost_list,
+  outcome_goal = -5,
+  outcome_goal_intention = "minimize",
+  optimization_method = "grid_search",
+  optimization_grid_search_step_size = c(0.1,0.1),
+  include_confidence_set = F
+)
+```
+
+```{r}
+# For month 4 data
+t_test_m4 <- t.test(delta_sbp_m1_m4 ~ studyarm, data = final_results_m1_m4)
+print(t_test_m4)
+
+# For month 8 data
+t_test_m8 <- t.test(delta_sbp_m1_m8 ~ studyarm, data = final_results_m1_m8)
+print(t_test_m8)
+
+# For month 12 data
+t_test_m12 <- t.test(delta_sbp_m1_m12 ~ studyarm, data = final_results_m1_m12)
+print(t_test_m12)
+```
+# GEE modeling:
+## Create GEE data:
+```{r}
+# # Step 1: Standardize column names for merging
+# final_results_m1_m4 <- final_results_m1_m4 %>%
+#   mutate(
+#     time = 1,
+#     avg_counseling = avg_counseling_m1_m4,
+#     avg_homebp_measurements = avg_homebp_measurements_m1_m4,
+#     sum_counseling = avg_counseling_m1_m4,
+#     sum_homebp_measurements = avg_homebp_measurements_m1_m4,
+#     delta_sbp = delta_sbp_m1_m4
+#   ) %>%
+#   select(pid, center, studyarm, time, avg_counseling, avg_homebp_measurements, sum_counseling, sum_homebp_measurements, delta_sbp)
+# 
+# final_results_m1_m8 <- final_results_m1_m8 %>%
+#   mutate(
+#     time = 2,
+#     avg_counseling = avg_counseling_m1_m8,
+#     avg_homebp_measurements = avg_homebp_measurements_m1_m8,
+#     sum_counseling = avg_counseling_m1_m8 * 2,
+#     sum_homebp_measurements = avg_homebp_measurements_m1_m8 * 2,
+#     delta_sbp = delta_sbp_m1_m8
+#   ) %>%
+#   select(pid, center, studyarm, time, avg_counseling, avg_homebp_measurements, sum_counseling, sum_homebp_measurements, delta_sbp)
+# 
+# final_results_m1_m12 <- final_results_m1_m12 %>%
+#   mutate(
+#     time = 3,
+#     avg_counseling = avg_counseling_m1_m12,
+#     avg_homebp_measurements = avg_homebp_measurements_m1_m12,
+#     sum_counseling = avg_counseling_m1_m12 * 3,
+#     sum_homebp_measurements = avg_homebp_measurements_m1_m12 * 3,
+#     delta_sbp = delta_sbp_m1_m12
+#   ) %>%
+#   select(pid, center, studyarm, time, avg_counseling, avg_homebp_measurements, sum_counseling, sum_homebp_measurements, delta_sbp)
+# 
+# # Step 2: Combine all timepoints into one dataset
+# gee_data <- bind_rows(final_results_m1_m4, final_results_m1_m8, final_results_m1_m12)
+# gee_data <- gee_data[order(gee_data$pid, gee_data$time), ]
+# gee_data$pid <- as.factor(gee_data$pid)
+```
+
+```{r}
+# # Step 1: Summarize mean and CI for ΔSBP
+# table4 <- gee_data %>%
+#   group_by(center, studyarm) %>%
+#   summarise(
+#     mean_dsbp = mean(delta_sbp, na.rm = TRUE),
+#     lower_dsbp = mean(delta_sbp, na.rm = TRUE) - 1.96 * sd(delta_sbp, na.rm = TRUE) / sqrt(sum(!is.na(delta_sbp))),
+#     upper_dsbp = mean(delta_sbp, na.rm = TRUE) + 1.96 * sd(delta_sbp, na.rm = TRUE) / sqrt(sum(!is.na(delta_sbp))),
+#     .groups = "drop"
+#   )
+
+# # Step 2: Recode study arm
+# table4 <- table4 %>%
+#   mutate(
+#     Study_Arm = ifelse(studyarm == 0, "Control", "Intervention"),
+#     Delta_SBP = sprintf("%.2f (%.2f, %.2f)", mean_dsbp, lower_dsbp, upper_dsbp)
+#   ) %>%
+#   select(Facility = center, Study_Arm, Delta_SBP)
+# 
+# # Step 3: View the table
+# print(table4)
+```
+
+
+```{r}
+# gee_model_sum <- geeglm(
+#   delta_sbp ~ 0 + sum_counseling + sum_homebp_measurements + factor(center),
+#   id = gee_data$pid,
+#   data = gee_data,
+#   family = gaussian(),
+#   corstr = "independence"
+# )
+# 
+# coeftest(gee_model_sum, vcov. = sandwich)
+# coefci(gee_model_sum, vcov. = sandwich, level = 0.95)
+# Exchangeble: Every repeated measure is equally correlated.
+# Autoregressive: Measures taken closer in time are more correlated.
+# Unstrcutured: every measure can be correlatd differently.
+```
+
+```{r}
+# gee_model_avg <- geeglm(
+#   delta_sbp ~ 0 + avg_counseling + avg_homebp_measurements + factor(center),
+#   id = gee_data$pid,
+#   data = gee_data,
+#   family = gaussian(),
+#   corstr = "independence"
+# )
+# 
+# coeftest(gee_model_avg, vcov. = sandwich)
+# coefci(gee_model_avg, vcov. = sandwich, level = 0.95)
+```
+
+
+
